@@ -1,0 +1,14 @@
+# Autonomous Personal Finance Agent – Python dependencies
+
+# Azure SQL connectivity
+pyodbc==5.2.0
+
+# .env file loader
+python-dotenv==1.1.0
+
+# REST API server (runs on Azure App Service)
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+
+# HTTP client (used by the agent via agent_client.py)
+requests==2.32.3
