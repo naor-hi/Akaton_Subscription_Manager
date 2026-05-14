@@ -12,3 +12,11 @@ uvicorn[standard]==0.34.2
 
 # HTTP client (used by the agent via agent_client.py)
 requests==2.32.3
+
+# Gmail API – search billing emails
+google-auth-oauthlib==1.2.0
+google-auth-httplib2==0.2.0
+google-api-python-client==2.107.0
+
+# Email parsing
+email-parser==0.1

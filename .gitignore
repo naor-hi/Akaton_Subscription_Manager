@@ -1,1 +1,13 @@
 .env
+
+# Gmail OAuth credentials (NEVER commit these!)
+gmail_credentials.json
+gmail_token.pickle
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.installed.cfg
+*.egg
