@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -23,7 +23,6 @@ llm_client = OpenAI(
 def analyze_emails_with_agent(raw_emails_text, existing_subs):
     """Passes the raw emails and current DB state to Gemini for full analysis."""
     
-    # We format the existing subscriptions so the LLM knows what IDs already exist
     existing_context = json.dumps(existing_subs, indent=2) if existing_subs else "None"
 
     system_prompt = f"""
@@ -68,7 +67,6 @@ def analyze_emails_with_agent(raw_emails_text, existing_subs):
 def analyze_roi_with_agent(usage_summary):
     """Analyzes subscription usage vs cost with strict mathematical overrides."""
     
-    # Format usage summary for the LLM
     usage_context = json.dumps(usage_summary, indent=2, default=str)
 
     system_prompt = """
@@ -93,7 +91,7 @@ def analyze_roi_with_agent(usage_summary):
         response = llm_client.chat.completions.create(
             model="google/gemini-2.5-flash",
             response_format={"type": "json_object"},
-            temperature=0.0, # Zero temperature forces strict adherence to the rules
+            temperature=0.0,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Analyze these subscriptions for ROI:\n\n{usage_context}"}
@@ -107,7 +105,6 @@ def analyze_roi_with_agent(usage_summary):
 def main():
     logger.info("Starting Autonomous Finance Agent...")
 
-    # 1. Initialize Server Client & Get Current State
     server = AgentClient()
     if not server.health_check():
         logger.error("Server is unreachable. Please start your Azure/Local server.")
@@ -116,16 +113,13 @@ def main():
     existing_subs = server.get_subscriptions()
     logger.info(f"Loaded {len(existing_subs)} existing subscriptions from the database.")
 
-    # 2. Fetch Emails from Gmail
     gmail_service = authenticate_gmail()
-    # Grabbing the 50 most recent to ensure we get history but don't overload processing time
     messages = fetch_subscription_emails(gmail_service, max_results=50) 
     
     if not messages:
         logger.info("No emails to process. Agent going to sleep.")
         return
 
-    # 3. Decode Emails into a single text block
     logger.info("Decoding email payloads...")
     combined_email_text = ""
     for msg in messages:
@@ -133,7 +127,6 @@ def main():
         text = decode_email_body(full_msg.get('payload', {}))
         combined_email_text += f"\n--- EMAIL START ---\n{text[:2000]}\n--- EMAIL END ---\n"
 
-    # 4. Agentic Analysis
     logger.info("Sending batch to Gemini via OpenRouter for analysis & matching...")
     llm_result = analyze_emails_with_agent(combined_email_text, existing_subs)
 
@@ -141,21 +134,26 @@ def main():
         logger.error("Failed to parse LLM output.")
         return
 
-    # 5. Sync Data Back to Server
     extracted_subs = llm_result["subscriptions"]
     logger.info(f"Agent identified {len(extracted_subs)} active subscriptions. Syncing to server...")
 
     for sub in extracted_subs:
         try:
-            logger.info(f"Upserting: {sub['service_name']} ({sub['monthly_cost']} ILS)")
+            sub_id = sub.get("subscription_id")
+            existing = next((s for s in existing_subs if s.get("subscription_id") == sub_id), {})
+            
+            logger.info(f"Upserting: {sub.get('service_name')} ({sub.get('monthly_cost')} ILS)")
             server.upsert_subscription(
-                subscription_id=sub.get("subscription_id"),
+                subscription_id=sub_id,
                 service_name=sub.get("service_name"),
                 monthly_cost=sub.get("monthly_cost"),
                 currency=sub.get("currency", "ILS"),
-                category=sub.get("category"),
-                billing_cycle=sub.get("billing_cycle"),
-                agent_recommendation=sub.get("agent_recommendation")
+                category=sub.get("category", existing.get("category")),
+                billing_cycle=sub.get("billing_cycle", existing.get("billing_cycle")),
+                agent_recommendation=sub.get("agent_recommendation"),
+                current_period_usage_hours=existing.get("current_period_usage_hours", 0.0),
+                unsubscribe_url=existing.get("unsubscribe_url"),
+                website_url=existing.get("website_url")
             )
         except Exception as e:
             logger.error(f"Failed to upsert {sub.get('subscription_id')}: {e}")
@@ -169,7 +167,6 @@ def main():
     logger.info("Phase 2: Analyzing ROI based on usage data...")
     logger.info("─"*70)
     
-    # Fetch current usage summary from server
     try:
         usage_summary = server.get_summary()
         if not usage_summary:
@@ -178,7 +175,6 @@ def main():
         
         logger.info(f"Fetched {len(usage_summary)} subscriptions with usage data.")
         
-        # Send to LLM for ROI analysis
         logger.info("Sending usage data to Gemini for ROI analysis...")
         roi_result = analyze_roi_with_agent(usage_summary)
         
@@ -186,7 +182,6 @@ def main():
             logger.error("Failed to parse ROI analysis output.")
             return
         
-        # Update subscriptions with new recommendations
         recommendations = roi_result["recommendations"]
         logger.info(f"Agent generated {len(recommendations)} recommendations. Updating database...")
         
@@ -196,23 +191,26 @@ def main():
                 new_rec = rec.get("agent_recommendation")
                 reasoning = rec.get("reasoning", "")
                 
-                # Find the full subscription data to preserve other fields
-                matching_sub = next((s for s in usage_summary if s["subscription_id"] == sub_id), None)
+                matching_sub = next((s for s in usage_summary if s.get("subscription_id") == sub_id), None)
                 if not matching_sub:
                     logger.warning(f"Subscription {sub_id} not found in usage summary.")
                     continue
                 
                 logger.info(f"  {matching_sub['service_name']:20} → {new_rec:25} ({reasoning})")
                 
-                # Update with new recommendation
+                # CRITICAL FIX 2: Explicitly pass only valid database fields to the client
                 server.upsert_subscription(
                     subscription_id=sub_id,
                     service_name=matching_sub.get("service_name"),
-                    monthly_cost=matching_sub.get("monthly_cost", 0),
+                    monthly_cost=matching_sub.get("monthly_cost", 0.0),
                     currency=matching_sub.get("currency", "ILS"),
                     category=matching_sub.get("category"),
+                    billing_cycle=matching_sub.get("billing_cycle"),
                     agent_recommendation=new_rec,
-                    last_sync_timestamp=datetime.utcnow().isoformat() + "Z"
+                    current_period_usage_hours=matching_sub.get("current_period_usage_hours", 0.0),
+                    unsubscribe_url=matching_sub.get("unsubscribe_url"),
+                    website_url=matching_sub.get("website_url"),
+                    last_sync_timestamp=datetime.now(timezone.utc).isoformat()
                 )
             except Exception as e:
                 logger.error(f"Failed to update recommendation for {sub_id}: {e}")

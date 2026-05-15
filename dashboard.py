@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import os
 import json
+import re
 import streamlit.components.v1 as components
 from openai import OpenAI
 from agent_client import AgentClient
@@ -12,7 +13,6 @@ from dotenv import load_dotenv
 load_dotenv()
 st.set_page_config(page_title="Agent Command Center", page_icon="🤖", layout="wide")
 
-# Custom CSS to fix the input box to the bottom and style the sidebar
 st.markdown("""
     <style>
     section[data-testid="stSidebar"] {
@@ -23,7 +23,6 @@ st.markdown("""
         padding: 10px;
         margin-bottom: 10px;
     }
-    /* Pins the chat input to the bottom of the sidebar */
     div[data-testid="stForm"] {
         border: none;
         padding: 0;
@@ -31,7 +30,6 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# Initialize OpenRouter Client
 llm_client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=os.getenv("OPENROUTER_API_KEY"),
@@ -47,13 +45,12 @@ def fetch_subscription_data():
 
 def get_cancellation_url(service_name):
     """Agentic function that asks Gemini ONLY for a direct URL."""
-    prompt = f"Provide ONLY the direct cancellation URL for {service_name}. Do not include any other text, formatting, or markdown. Just the raw https:// link."
-    
+    prompt = f"Provide ONLY the direct cancellation URL for {service_name}. Do not include any other text. Just the raw https:// link."
     try:
         response = llm_client.chat.completions.create(
             model="google/gemini-2.5-flash",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.1 # Keep it strictly factual
+            temperature=0.1 
         )
         url = response.choices[0].message.content.strip()
         if url.startswith("http"):
@@ -63,20 +60,26 @@ def get_cancellation_url(service_name):
     return None
 
 def get_agent_response(user_input, context_data, history):
-    """Commands Gemini 2.5 Flash to act as a high-tier financial assistant."""
+    """Commands Gemini with strict instructions for autonomous web actions."""
     system_prompt = f"""
-    You are the Akaton Financial Agent (Gemini 2.5 Flash). 
-    You are an expert in SaaS, digital subscriptions, and web navigation.
+    You are the Akaton Financial Agent (Gemini 2.5 Flash). You are autonomous and proactive.
 
     CORE COMMANDS:
-    1. WEB ACCESS: Use your internal knowledge to provide DIRECT URLs for cancellation or signup.
-    2. COMPARISONS: If asked for alternatives (VPNs, Music, AI tools), provide a detailed breakdown.
-    3. CONTEXT: You have the user's specific subscription and usage data below.
+    1. WEB ACCESS: Use your internal knowledge to provide specific recommendations.
+    2. DATA CONTEXT: Use the user's data to give highly personalized advice.
+    
+    3. AUTONOMOUS ACTIONS (CRITICAL): 
+    If a user asks for a recommendation for a new service (like a VPN, a new bank, a cheaper streaming service, etc.), and you make a definitive recommendation, you MUST append a secret action tag at the very end of your response in this exact format:
+    [ACTION_OPEN_URL: https://www.direct-url-to-service.com]
+    
+    Example: 
+    "I recommend NordVPN based on your needs."
+    [ACTION_OPEN_URL: https://nordvpn.com]
     
     USER DATA:
     {json.dumps(context_data, indent=2)}
     
-    Tone: Professional, direct, and efficient.
+    Tone: Proactive, sharp, and decisive.
     """
     
     messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_input}]
@@ -91,9 +94,8 @@ def get_agent_response(user_input, context_data, history):
 # --- 3. Sidebar Agent Copilot ---
 with st.sidebar:
     st.title("💬 Agent Copilot")
-    st.caption("Gemini 2.5 Flash | Financial Analysis")
+    st.caption("Gemini 2.5 Flash | Autonomous Web Actions")
     
-    # Scrollable container for chat
     chat_container = st.container(height=550)
     
     if "messages" not in st.session_state:
@@ -104,8 +106,7 @@ with st.sidebar:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
-    # Chat Input pinned to bottom
-    if prompt := st.chat_input("Ask for a link, comparison, or insight..."):
+    if prompt := st.chat_input("Ask for a recommendation or action..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with chat_container:
             with st.chat_message("user"):
@@ -113,9 +114,28 @@ with st.sidebar:
 
             with st.chat_message("assistant"):
                 current_data = fetch_subscription_data()
-                response = get_agent_response(prompt, current_data, st.session_state.messages[:-1])
-                st.markdown(response)
-                st.session_state.messages.append({"role": "assistant", "content": response})
+                raw_response = get_agent_response(prompt, current_data, st.session_state.messages[:-1])
+                
+                # --- AGENTIC PARSER LOGIC ---
+                action_url = None
+                # Use Regex to hunt for the secret tag
+                action_match = re.search(r'\[ACTION_OPEN_URL:\s*(http[^\s\]]+)\]', raw_response)
+                
+                if action_match:
+                    action_url = action_match.group(1)
+                    # Erase the tag from the text so the user doesn't see the raw code
+                    clean_response = raw_response.replace(action_match.group(0), "").strip()
+                else:
+                    clean_response = raw_response
+                
+                st.markdown(clean_response)
+                st.session_state.messages.append({"role": "assistant", "content": clean_response})
+                
+                # Execute the autonomous action
+                if action_url:
+                    js_code = f"window.open('{action_url}', '_blank');"
+                    components.html(f"<script>{js_code}</script>", height=0)
+                    st.success(f"Agent autonomously opened: {action_url}")
 
 # --- 4. Main Dashboard UI ---
 st.title("🤖 Agent Command Center")
@@ -128,9 +148,7 @@ if data is None:
 else:
     df = pd.DataFrame(data)
     
-    # --- Metrics ---
     total_monthly = df['monthly_cost'].sum()
-    # Filter for wasteful items
     waste_df = df[df['agent_recommendation'].str.contains('cancel|Expensive|Review', case=False, na=False)]
     identified_waste = waste_df['monthly_cost'].sum()
 
@@ -141,7 +159,6 @@ else:
 
     st.divider()
 
-    # --- Action Center ---
     st.subheader("🎯 Agent Action Center")
     critical_subs = waste_df.to_dict('records')
     
@@ -156,34 +173,26 @@ else:
                     st.write(f"**Cost:** ₪ {sub['monthly_cost']} | **Usage:** {sub['current_period_usage_hours']}h/mo")
                     st.warning(f"**AI Insight:** {sub['agent_recommendation']}")
                     
-                    # CANCELLATION LOGIC
                     c1, c2 = st.columns(2)
                     url = sub.get('unsubscribe_url')
                     
-                    # If we already have the URL in the database
                     if url and url != "NULL":
                         c1.link_button("Cancel Subscription", url, type="primary", use_container_width=True)
                     else:
-                        # The Agentic Button: Finds the link and forces a redirect
                         if c1.button("Cancel Subscription", key=f"src_{sub['subscription_id']}", type="primary", use_container_width=True):
                             with st.spinner("Agent locating cancel page..."):
                                 found_url = get_cancellation_url(sub['service_name'])
-                                
                                 if found_url:
-                                    # Inject JavaScript to instantly pop open the new tab
                                     js_code = f"window.open('{found_url}', '_blank');"
                                     components.html(f"<script>{js_code}</script>", height=0)
-                                    
-                                    # Fallback button just in case the user's browser blocks pop-ups
                                     st.success("Found it!")
                                     st.link_button("Click here if tab didn't open", found_url, use_container_width=True)
                                 else:
                                     st.error("Agent could not find a direct link.")
                     
-                    c2.button("Dismiss", key=f"kp_{sub['subscription_id']}", use_container_width=True)
+                    c2.button("Keep Service", key=f"kp_{sub['subscription_id']}", use_container_width=True)
 
     st.divider()
 
-    # --- Data Vault ---
     st.subheader("📂 Subscription Data Vault")
     st.dataframe(df[['service_name', 'category', 'monthly_cost', 'current_period_usage_hours', 'agent_recommendation']], use_container_width=True)
