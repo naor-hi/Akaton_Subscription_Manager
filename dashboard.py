@@ -69,12 +69,8 @@ def get_agent_response(user_input, context_data, history):
     2. DATA CONTEXT: Use the user's data to give highly personalized advice.
     
     3. AUTONOMOUS ACTIONS (CRITICAL): 
-    If a user asks for a recommendation for a new service (like a VPN, a new bank, a cheaper streaming service, etc.), and you make a definitive recommendation, you MUST append a secret action tag at the very end of your response in this exact format:
+    If a user asks for a recommendation for a new service, and you make a definitive recommendation, you MUST append a secret action tag at the very end of your response in this exact format:
     [ACTION_OPEN_URL: https://www.direct-url-to-service.com]
-    
-    Example: 
-    "I recommend NordVPN based on your needs."
-    [ACTION_OPEN_URL: https://nordvpn.com]
     
     USER DATA:
     {json.dumps(context_data, indent=2)}
@@ -116,14 +112,11 @@ with st.sidebar:
                 current_data = fetch_subscription_data()
                 raw_response = get_agent_response(prompt, current_data, st.session_state.messages[:-1])
                 
-                # --- AGENTIC PARSER LOGIC ---
                 action_url = None
-                # Use Regex to hunt for the secret tag
                 action_match = re.search(r'\[ACTION_OPEN_URL:\s*(http[^\s\]]+)\]', raw_response)
                 
                 if action_match:
                     action_url = action_match.group(1)
-                    # Erase the tag from the text so the user doesn't see the raw code
                     clean_response = raw_response.replace(action_match.group(0), "").strip()
                 else:
                     clean_response = raw_response
@@ -131,7 +124,6 @@ with st.sidebar:
                 st.markdown(clean_response)
                 st.session_state.messages.append({"role": "assistant", "content": clean_response})
                 
-                # Execute the autonomous action
                 if action_url:
                     js_code = f"window.open('{action_url}', '_blank');"
                     components.html(f"<script>{js_code}</script>", height=0)
@@ -148,8 +140,11 @@ if data is None:
 else:
     df = pd.DataFrame(data)
     
-    total_monthly = df['monthly_cost'].sum()
+    # Split the data into Waste and Keep
     waste_df = df[df['agent_recommendation'].str.contains('cancel|Expensive|Review', case=False, na=False)]
+    keep_df = df[df['agent_recommendation'].str.contains('Keep', case=False, na=False)]
+    
+    total_monthly = df['monthly_cost'].sum()
     identified_waste = waste_df['monthly_cost'].sum()
 
     m_col1, m_col2, m_col3 = st.columns(3)
@@ -160,6 +155,9 @@ else:
     st.divider()
 
     st.subheader("🎯 Agent Action Center")
+    
+    # --- SECTION A: Needs Attention ---
+    st.markdown("#### 🚨 Needs Attention")
     critical_subs = waste_df.to_dict('records')
     
     if not critical_subs:
@@ -190,7 +188,25 @@ else:
                                 else:
                                     st.error("Agent could not find a direct link.")
                     
-                    c2.button("Keep Service", key=f"kp_{sub['subscription_id']}", use_container_width=True)
+                    c2.button("Dismiss Alert", key=f"kp_{sub['subscription_id']}", use_container_width=True)
+
+    st.divider() # Physical separation line
+
+    # --- SECTION B: Optimized & Kept ---
+    st.markdown("#### ✅ Optimized & Active")
+    kept_subs = keep_df.to_dict('records')
+    
+    if not kept_subs:
+        st.info("No active subscriptions are currently marked to keep.")
+    else:
+        cols2 = st.columns(2)
+        for idx, sub in enumerate(kept_subs):
+            with cols2[idx % 2]:
+                with st.container(border=True):
+                    st.write(f"### {sub['service_name']}")
+                    st.write(f"**Cost:** ₪ {sub['monthly_cost']} | **Usage:** {sub['current_period_usage_hours']}h/mo")
+                    # Using st.success to give it a green, positive styling
+                    st.success(f"**AI Insight:** {sub['agent_recommendation']}")
 
     st.divider()
 
