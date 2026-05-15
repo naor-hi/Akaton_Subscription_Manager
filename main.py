@@ -66,34 +66,34 @@ def analyze_emails_with_agent(raw_emails_text, existing_subs):
         return None
 
 def analyze_roi_with_agent(usage_summary):
-    """Analyzes subscription usage vs cost and recommends which to keep/cancel."""
+    """Analyzes subscription usage vs cost with strict mathematical overrides."""
     
     # Format usage summary for the LLM
     usage_context = json.dumps(usage_summary, indent=2, default=str)
 
     system_prompt = """
-    You are a personal finance optimization AI.
+    You are a strict, logical personal finance optimization AI.
     Your task is to analyze each subscription's usage and cost, then recommend whether to keep or cancel.
-
-    ANALYSIS RULES:
-    1. ZERO USAGE: If current_period_usage_hours is 0, recommend "Consider canceling" with reason.
-    2. BELOW THRESHOLD: If usage < usage_threshold_hours, recommend "Review – below target usage" with reason.
-    3. COST PER HOUR: Calculate effective hourly cost (monthly_cost / usage_hours). If > 50 ILS/hour, flag as "Expensive for the value".
-    4. LONG-TERM CONTRACTS: If billing_cycle is "yearly", be more lenient – the user committed.
-    5. KEEP RECOMMENDATION: If usage > threshold AND reasonable cost per hour, recommend "Keep – active subscription".
+    
+    CRITICAL OVERRIDE RULES (YOU MUST OBEY THESE STRICTLY):
+    1. HIGH USAGE OVERRIDE: If `current_period_usage_hours` is greater than 10, you MUST output "Keep - active subscription". You cannot recommend canceling high-usage services.
+    2. ZERO USAGE: If `current_period_usage_hours` is 0, you MUST output "Consider canceling".
+    3. FREE SERVICES: If `monthly_cost` is 0.0, output "Keep - active subscription" (unless usage is 0, then cancel).
+    4. COST EFFICIENCY: For usage between 1 and 10 hours, calculate effective hourly cost (monthly_cost / usage_hours). If > 50 ILS/hour, output "Expensive for the value".
 
     OUTPUT FORMAT: Return a JSON object with an array "recommendations" where each item has:
-    {{
+    {
         "subscription_id": "string",
-        "agent_recommendation": "Keep | Review – below threshold | Consider canceling | Expensive for the value",
-        "reasoning": "Brief explanation (50 chars max)"
-    }}
+        "agent_recommendation": "Keep - active subscription | Review - below threshold | Consider canceling | Expensive for the value",
+        "reasoning": "Brief explanation with exact math (e.g., '60 hours of usage justifies the cost')"
+    }
     """
 
     try:
         response = llm_client.chat.completions.create(
             model="google/gemini-2.5-flash",
             response_format={"type": "json_object"},
+            temperature=0.0, # Zero temperature forces strict adherence to the rules
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Analyze these subscriptions for ROI:\n\n{usage_context}"}
