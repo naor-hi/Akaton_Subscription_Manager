@@ -94,7 +94,7 @@ CREATE TABLE user_subscriptions (
     next_billing_date           DATE            NULL,
     current_period_usage_hours  DECIMAL(8, 2)   NOT NULL DEFAULT 0,
     usage_threshold_hours       DECIMAL(8, 2)   NULL,
-    agent_recommendation        NVARCHAR(16)    NULL,
+    agent_recommendation        NVARCHAR(256)    NULL,
     last_sync_timestamp         DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME()
 );
 """
@@ -114,6 +114,40 @@ CREATE TABLE daily_usage_log (
     -- Idempotency: one row per (subscription × day × device)
     CONSTRAINT uq_usage_per_day_device
         UNIQUE (subscription_id, log_date, device_type)
+);
+"""
+
+_DDL_DEVICES = """
+IF NOT EXISTS (
+    SELECT 1 FROM sys.tables WHERE name = 'devices'
+)
+CREATE TABLE devices (
+    device_id       NVARCHAR(128)   NOT NULL PRIMARY KEY,
+    device_name     NVARCHAR(256)   NOT NULL,
+    device_type     NVARCHAR(64)    NOT NULL,
+    owner_label     NVARCHAR(128)   NULL,
+    registered_at   DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME(),
+    last_seen_at    DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME()
+);
+"""
+
+_DDL_DEVICE_USAGE = """
+IF NOT EXISTS (
+    SELECT 1 FROM sys.tables WHERE name = 'device_usage'
+)
+CREATE TABLE device_usage (
+    usage_id            INT             NOT NULL IDENTITY(1,1) PRIMARY KEY,
+    device_id           NVARCHAR(128)   NOT NULL
+        REFERENCES devices(device_id) ON DELETE CASCADE,
+    subscription_id     NVARCHAR(128)   NOT NULL
+        REFERENCES user_subscriptions(subscription_id) ON DELETE CASCADE,
+    usage_date          DATE            NOT NULL,
+    usage_hours         DECIMAL(8, 2)   NOT NULL DEFAULT 0,
+    reported_at         DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME(),
+
+    -- One row per (device × subscription × day)
+    CONSTRAINT uq_device_usage_per_day
+        UNIQUE (device_id, subscription_id, usage_date)
 );
 """
 
@@ -145,12 +179,13 @@ def _get_connection():
 # ---------------------------------------------------------------------------
 def initialize_db() -> None:
     """
-    Create the Azure SQL tables if they don't already exist.
+    Create all Azure SQL tables if they don't already exist.
 
     Tables created:
       • user_subscriptions  – one row per tracked service.
-      • daily_usage_log     – device-level usage telemetry, one row per
-                              (subscription_id, log_date, device_type).
+      • daily_usage_log     – legacy device telemetry (kept for compatibility).
+      • devices             – one row per registered device.
+      • device_usage        – usage per device per subscription per day.
 
     Safe to call multiple times; uses IF NOT EXISTS guards.
     """
@@ -163,7 +198,11 @@ def initialize_db() -> None:
         cursor = conn.cursor()
         cursor.execute(_DDL_USER_SUBSCRIPTIONS)
         cursor.execute(_DDL_DAILY_USAGE_LOG)
-    logger.info("Schema ready (user_subscriptions, daily_usage_log).")
+        cursor.execute(_DDL_DEVICES)
+        cursor.execute(_DDL_DEVICE_USAGE)
+        # Ensure agent_recommendation column is large enough
+        cursor.execute("ALTER TABLE user_subscriptions ALTER COLUMN agent_recommendation NVARCHAR(256);")
+    logger.info("Schema ready (user_subscriptions, daily_usage_log, devices, device_usage).")
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +311,227 @@ def get_all_subscriptions(
         columns = [col[0] for col in cursor.description]
         rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
     logger.debug("Fetched %d subscription(s).", len(rows))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Device registry
+# ---------------------------------------------------------------------------
+
+def register_device(
+    device_id: str,
+    device_name: str,
+    device_type: str,
+    owner_label: Optional[str] = None,
+) -> None:
+    """
+    Register a new device or update its name/type/owner if it already exists.
+
+    Args:
+        device_id:   Stable unique identifier for the device (e.g. MAC address,
+                     UUID, or any slug the device generates once).
+        device_name: Human-readable name, e.g. ``"Amit's iPhone"``.
+        device_type: e.g. ``"mobile"``, ``"desktop"``, ``"smart_tv"``.
+        owner_label: Optional free-text owner tag, e.g. ``"Amit"``.
+    """
+    sql = """
+        MERGE devices AS target
+        USING (VALUES (?, ?, ?, ?))
+              AS source (device_id, device_name, device_type, owner_label)
+        ON target.device_id = source.device_id
+        WHEN MATCHED THEN
+            UPDATE SET
+                device_name  = source.device_name,
+                device_type  = source.device_type,
+                owner_label  = source.owner_label,
+                last_seen_at = SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT (device_id, device_name, device_type, owner_label)
+            VALUES (source.device_id, source.device_name,
+                    source.device_type, source.owner_label);
+    """
+    with _get_connection() as conn:
+        conn.cursor().execute(sql, (device_id, device_name, device_type, owner_label))
+    logger.info("Device '%s' (%s) registered.", device_id, device_name)
+
+
+def get_all_devices() -> list[dict]:
+    """
+    Return all registered devices ordered by device_name.
+
+    Returns:
+        List of dicts with keys: device_id, device_name, device_type,
+        owner_label, registered_at, last_seen_at.
+    """
+    sql = "SELECT * FROM devices ORDER BY device_name;"
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        columns = [col[0] for col in cursor.description]
+        rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+    logger.debug("get_all_devices: returned %d row(s).", len(rows))
+    return rows
+
+
+def delete_device(device_id: str) -> bool:
+    """
+    Delete a device and all its usage history (CASCADE).
+
+    Returns:
+        True if deleted, False if not found.
+    """
+    sql = "DELETE FROM devices WHERE device_id = ?;"
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(sql, (device_id,))
+        deleted = cursor.rowcount > 0
+    if deleted:
+        logger.info("Device '%s' deleted.", device_id)
+    else:
+        logger.warning("delete_device: '%s' not found.", device_id)
+    return deleted
+
+
+# ---------------------------------------------------------------------------
+# Device usage log
+# ---------------------------------------------------------------------------
+
+def log_device_usage(
+    device_id: str,
+    subscription_id: str,
+    usage_date: date,
+    usage_hours: float,
+) -> None:
+    """
+    Record (or update) how many hours a specific device used a subscription
+    on a given day. Idempotent — re-sending the same event overwrites.
+
+    Args:
+        device_id:       Must match a registered device in ``devices``.
+        subscription_id: Must match a row in ``user_subscriptions``.
+        usage_date:      Calendar date of the usage.
+        usage_hours:     Hours of active use on that device that day.
+
+    Raises:
+        ValueError: If usage_hours is negative.
+    """
+    if usage_hours < 0:
+        raise ValueError(f"usage_hours must be non-negative, got {usage_hours}.")
+
+    sql = """
+        MERGE device_usage AS target
+        USING (VALUES (?, ?, ?, ?))
+              AS source (device_id, subscription_id, usage_date, usage_hours)
+        ON  target.device_id       = source.device_id
+        AND target.subscription_id = source.subscription_id
+        AND target.usage_date      = source.usage_date
+        WHEN MATCHED THEN
+            UPDATE SET
+                usage_hours  = source.usage_hours,
+                reported_at  = SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT (device_id, subscription_id, usage_date, usage_hours)
+            VALUES (source.device_id, source.subscription_id,
+                    source.usage_date, source.usage_hours);
+    """
+    with _get_connection() as conn:
+        conn.cursor().execute(
+            sql,
+            (device_id, subscription_id, usage_date.isoformat(), usage_hours)
+        )
+    logger.info(
+        "Device usage logged: device='%s' sub='%s' date=%s → %.2fh.",
+        device_id, subscription_id, usage_date, usage_hours,
+    )
+
+
+def get_device_usage_summary() -> list[dict]:
+    """
+    Return aggregated usage per subscription across ALL devices
+    for the current calendar month.
+
+    Columns returned:
+      subscription_id, service_name, monthly_cost, currency,
+      unsubscribe_url, agent_recommendation,
+      total_usage_hours  (sum across all devices this month),
+      usage_threshold_hours, device_breakdown (JSON-style list)
+
+    Returns:
+        List of dicts ordered by total_usage_hours ASC
+        (least-used subscriptions first — top cancel candidates).
+    """
+    sql = """
+        SELECT
+            s.subscription_id,
+            s.service_name,
+            s.monthly_cost,
+            s.currency,
+            s.unsubscribe_url,
+            s.agent_recommendation,
+            s.usage_threshold_hours,
+            COALESCE(SUM(du.usage_hours), 0)              AS total_usage_hours,
+            CASE
+                WHEN COALESCE(SUM(du.usage_hours), 0) = 0 THEN NULL
+                ELSE ROUND(
+                    CAST(s.monthly_cost AS FLOAT) /
+                    COALESCE(SUM(du.usage_hours), 1), 4)
+            END                                           AS cost_per_hour
+        FROM user_subscriptions s
+        LEFT JOIN device_usage du
+               ON du.subscription_id = s.subscription_id
+              AND FORMAT(du.usage_date, 'yyyy-MM') =
+                  FORMAT(GETUTCDATE(), 'yyyy-MM')
+        GROUP BY
+            s.subscription_id, s.service_name, s.monthly_cost,
+            s.currency, s.unsubscribe_url, s.agent_recommendation,
+            s.usage_threshold_hours
+        ORDER BY total_usage_hours ASC;
+    """
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        columns = [col[0] for col in cursor.description]
+        rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+    logger.debug("get_device_usage_summary: %d subscription(s).", len(rows))
+    return rows
+
+
+def get_per_device_breakdown(subscription_id: str) -> list[dict]:
+    """
+    Return usage broken down by device for a specific subscription
+    in the current calendar month.
+
+    Args:
+        subscription_id: Which subscription to inspect.
+
+    Returns:
+        List of dicts: device_id, device_name, device_type,
+        owner_label, total_hours_this_month.
+    """
+    sql = """
+        SELECT
+            d.device_id,
+            d.device_name,
+            d.device_type,
+            d.owner_label,
+            COALESCE(SUM(du.usage_hours), 0) AS total_hours_this_month
+        FROM devices d
+        LEFT JOIN device_usage du
+               ON du.device_id = d.device_id
+              AND du.subscription_id = ?
+              AND FORMAT(du.usage_date, 'yyyy-MM') =
+                  FORMAT(GETUTCDATE(), 'yyyy-MM')
+        GROUP BY d.device_id, d.device_name, d.device_type, d.owner_label
+        ORDER BY total_hours_this_month DESC;
+    """
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(sql, (subscription_id,))
+        columns = [col[0] for col in cursor.description]
+        rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+    logger.debug(
+        "get_per_device_breakdown('%s'): %d device(s).", subscription_id, len(rows)
+    )
     return rows
 
 

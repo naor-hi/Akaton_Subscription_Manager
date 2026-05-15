@@ -240,6 +240,98 @@ class AgentClient:
         )
         return self._delete(f"/usage/{subscription_id}", params=params or None)
 
+    # ── Device registry ──────────────────────────────────────────────────────
+
+    def register_device(
+        self,
+        device_id: str,
+        device_name: str,
+        device_type: str,
+        owner_label: Optional[str] = None,
+    ) -> dict:
+        """
+        Register this device with the server (idempotent — call on every startup).
+
+        Args:
+            device_id:   Stable unique ID for this device (e.g. MAC address or UUID).
+            device_name: Human-readable name, e.g. ``"Amit's iPhone"``.
+            device_type: e.g. ``"mobile"``, ``"desktop"``, ``"smart_tv"``.
+            owner_label: Optional owner tag, e.g. ``"Amit"``.
+        """
+        payload = {
+            "device_id": device_id,
+            "device_name": device_name,
+            "device_type": device_type,
+            "owner_label": owner_label,
+        }
+        logger.debug("register_device → %s", device_id)
+        return self._post("/devices", payload)
+
+    def get_devices(self) -> list[dict]:
+        """Return all registered devices."""
+        logger.debug("get_devices ←")
+        return self._get("/devices")
+
+    def delete_device(self, device_id: str) -> dict:
+        """Delete a device and all its usage history."""
+        logger.debug("delete_device → %s", device_id)
+        return self._delete(f"/devices/{device_id}")
+
+    # ── Device usage ─────────────────────────────────────────────────────────
+
+    def log_device_usage(
+        self,
+        device_id: str,
+        subscription_id: str,
+        usage_date: date,
+        usage_hours: float,
+    ) -> dict:
+        """
+        Report how many hours this device used a subscription on a given day.
+
+        Idempotent — re-sending the same (device_id, subscription_id, usage_date)
+        simply overwrites the hours.
+
+        Args:
+            device_id:       This device's unique ID (must be registered first).
+            subscription_id: Which subscription was used.
+            usage_date:      The calendar date of usage.
+            usage_hours:     Hours of active use on that day.
+        """
+        payload = {
+            "device_id": device_id,
+            "subscription_id": subscription_id,
+            "usage_date": usage_date.isoformat(),
+            "usage_hours": usage_hours,
+        }
+        logger.debug(
+            "log_device_usage → device=%s sub=%s date=%s %.2fh",
+            device_id, subscription_id, usage_date, usage_hours,
+        )
+        return self._post("/devices/usage", payload)
+
+    def get_device_usage_summary(self) -> list[dict]:
+        """
+        Fetch total usage per subscription aggregated across ALL devices
+        for the current month. Ordered least-used first (top cancel candidates).
+        """
+        logger.debug("get_device_usage_summary ←")
+        return self._get("/devices/usage/summary")
+
+    def get_device_breakdown(self, subscription_id: str) -> list[dict]:
+        """
+        Fetch per-device usage breakdown for one subscription this month.
+
+        Args:
+            subscription_id: Which subscription to inspect.
+
+        Returns:
+            List of dicts: device_id, device_name, device_type,
+            owner_label, total_hours_this_month.
+        """
+        logger.debug("get_device_breakdown ← %s", subscription_id)
+        return self._get(f"/devices/usage/breakdown/{subscription_id}")
+
     def get_raw_subscriptions(self) -> list[dict]:
         """
         Fetch all subscriptions in RawSubscriptionData format.

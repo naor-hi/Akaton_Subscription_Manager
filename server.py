@@ -116,6 +116,47 @@ class StatusResponse(BaseModel):
     message: str
 
 
+# ── Device models ─────────────────────────────────────────────────────────────
+
+class DeviceIn(BaseModel):
+    device_id:   str           = Field(...,  example="device-iphone-amit")
+    device_name: str           = Field(...,  example="Amit's iPhone")
+    device_type: str           = Field(...,  example="mobile")
+    owner_label: Optional[str] = Field(None, example="Amit")
+
+
+class DeviceOut(DeviceIn):
+    registered_at: Optional[str] = None
+    last_seen_at:  Optional[str] = None
+
+
+class DeviceUsageIn(BaseModel):
+    device_id:       str   = Field(..., example="device-iphone-amit")
+    subscription_id: str   = Field(..., example="netflix_il")
+    usage_date:      date  = Field(..., example="2026-05-14")
+    usage_hours:     float = Field(..., ge=0, example=1.5)
+
+
+class DeviceUsageSummaryRow(BaseModel):
+    subscription_id:      str
+    service_name:         str
+    monthly_cost:         float
+    currency:             str
+    unsubscribe_url:      Optional[str]
+    agent_recommendation: Optional[str]
+    usage_threshold_hours: Optional[float]
+    total_usage_hours:    float
+    cost_per_hour:        Optional[float]
+
+
+class DeviceBreakdownRow(BaseModel):
+    device_id:             str
+    device_name:           str
+    device_type:           str
+    owner_label:           Optional[str]
+    total_hours_this_month: float
+
+
 # ── Analysis Engine models ────────────────────────────────────────────────────
 
 class RawSubscriptionData(BaseModel):
@@ -202,7 +243,15 @@ def get_subscriptions():
     """Returns every subscription ordered by service name."""
     try:
         rows = db.get_all_subscriptions()
-        return [dict(r) for r in rows]
+        result = []
+        for r in rows:
+            d = dict(r)
+            if d.get('next_billing_date'):
+                d['next_billing_date'] = d['next_billing_date'].isoformat()
+            if d.get('last_sync_timestamp'):
+                d['last_sync_timestamp'] = d['last_sync_timestamp'].isoformat()
+            result.append(d)
+        return result
     except Exception as exc:
         logger.error("get_subscriptions failed: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -274,6 +323,140 @@ def delete_usage(
         }
     except Exception as exc:
         logger.error("delete_usage failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── Device registry ──────────────────────────────────────────────────────────
+
+@app.post(
+    "/devices",
+    response_model=StatusResponse,
+    tags=["Devices"],
+    summary="Register a device or update its info",
+)
+def register_device(payload: DeviceIn):
+    """
+    Called once per device on first run (or whenever device info changes).
+    Idempotent — safe to call on every startup.
+    """
+    try:
+        db.register_device(
+            device_id=payload.device_id,
+            device_name=payload.device_name,
+            device_type=payload.device_type,
+            owner_label=payload.owner_label,
+        )
+        return {"status": "ok", "message": f"Device '{payload.device_id}' registered."}
+    except Exception as exc:
+        logger.error("register_device failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get(
+    "/devices",
+    response_model=list[DeviceOut],
+    tags=["Devices"],
+    summary="List all registered devices",
+)
+def get_devices():
+    """Returns every registered device ordered by name."""
+    try:
+        return db.get_all_devices()
+    except Exception as exc:
+        logger.error("get_devices failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.delete(
+    "/devices/{device_id}",
+    response_model=StatusResponse,
+    tags=["Devices"],
+    summary="Delete a device and all its usage history",
+)
+def delete_device(device_id: str):
+    """Permanently removes the device and all its device_usage rows (CASCADE)."""
+    try:
+        deleted = db.delete_device(device_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"Device '{device_id}' not found.")
+        return {"status": "ok", "message": f"Device '{device_id}' deleted."}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("delete_device failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── Device usage ──────────────────────────────────────────────────────────────
+
+@app.post(
+    "/devices/usage",
+    response_model=StatusResponse,
+    tags=["Devices"],
+    summary="Log usage from a specific device (idempotent)",
+)
+def log_device_usage(payload: DeviceUsageIn):
+    """
+    Called by each device to report how many hours it used a subscription.
+    Re-sending the same (device_id, subscription_id, usage_date) overwrites
+    the hours — safe to call multiple times.
+    """
+    try:
+        db.log_device_usage(
+            device_id=payload.device_id,
+            subscription_id=payload.subscription_id,
+            usage_date=payload.usage_date,
+            usage_hours=payload.usage_hours,
+        )
+        return {
+            "status": "ok",
+            "message": (
+                f"Usage logged: device='{payload.device_id}' "
+                f"sub='{payload.subscription_id}' "
+                f"date={payload.usage_date} → {payload.usage_hours}h"
+            ),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        logger.error("log_device_usage failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get(
+    "/devices/usage/summary",
+    response_model=list[DeviceUsageSummaryRow],
+    tags=["Devices"],
+    summary="Aggregated usage per subscription across all devices (current month)",
+)
+def get_device_usage_summary():
+    """
+    Returns total usage hours per subscription aggregated from ALL devices
+    for the current calendar month. Ordered least-used first.
+    """
+    try:
+        return db.get_device_usage_summary()
+    except Exception as exc:
+        logger.error("get_device_usage_summary failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get(
+    "/devices/usage/breakdown/{subscription_id}",
+    response_model=list[DeviceBreakdownRow],
+    tags=["Devices"],
+    summary="Per-device usage breakdown for one subscription",
+)
+def get_device_breakdown(subscription_id: str):
+    """
+    Shows how many hours each device contributed to a subscription
+    in the current month. Useful for the agent to see which device
+    is driving (or not driving) usage.
+    """
+    try:
+        return db.get_per_device_breakdown(subscription_id)
+    except Exception as exc:
+        logger.error("get_device_breakdown failed: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -356,7 +539,16 @@ def get_summary():
     """
     try:
         rows = db.get_usage_summary()
-        return rows
+        result = []
+        for r in rows:
+            d = dict(r)
+            # Convert date/datetime objects to ISO strings for JSON serialization
+            if d.get('next_billing_date'):
+                d['next_billing_date'] = d['next_billing_date'].isoformat()
+            if d.get('last_sync_timestamp'):
+                d['last_sync_timestamp'] = d['last_sync_timestamp'].isoformat()
+            result.append(d)
+        return result
     except Exception as exc:
         logger.error("get_summary failed: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
