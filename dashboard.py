@@ -156,19 +156,31 @@ else:
                     st.write(f"**Cost:** ₪ {sub['monthly_cost']} | **Usage:** {sub['current_period_usage_hours']}h/mo")
                     st.warning(f"**AI Insight:** {sub['agent_recommendation']}")
                     
+                    # CANCELLATION LOGIC
                     c1, c2 = st.columns(2)
                     url = sub.get('unsubscribe_url')
                     
-                    # Direct Link vs Find Link logic
+                    # If we already have the URL in the database
                     if url and url != "NULL":
-                        c1.link_button("Cancel Page ↗️", url, type="primary", use_container_width=True)
+                        c1.link_button("Cancel Subscription", url, type="primary", use_container_width=True)
                     else:
-                        if c1.button(f"🔍 Find Link", key=f"src_{sub['subscription_id']}", use_container_width=True):
-                            search_prompt = f"Find me the direct cancellation URL for {sub['service_name']}."
-                            st.session_state.messages.append({"role": "user", "content": search_prompt})
-                            st.rerun()
+                        # The Agentic Button: Finds the link and forces a redirect
+                        if c1.button("Cancel Subscription", key=f"src_{sub['subscription_id']}", type="primary", use_container_width=True):
+                            with st.spinner("Agent locating cancel page..."):
+                                found_url = get_cancellation_url(sub['service_name'])
+                                
+                                if found_url:
+                                    # Inject JavaScript to instantly pop open the new tab
+                                    js_code = f"window.open('{found_url}', '_blank');"
+                                    components.html(f"<script>{js_code}</script>", height=0)
+                                    
+                                    # Fallback button just in case the user's browser blocks pop-ups
+                                    st.success("Found it!")
+                                    st.link_button("Click here if tab didn't open", found_url, use_container_width=True)
+                                else:
+                                    st.error("Agent could not find a direct link.")
                     
-                    c2.button("Keep Service", key=f"kp_{sub['subscription_id']}", use_container_width=True)
+                    c2.button("Dismiss", key=f"kp_{sub['subscription_id']}", use_container_width=True)
 
     st.divider()
 
